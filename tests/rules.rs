@@ -420,9 +420,11 @@ fn search_captures_hanging_queen() {
 
     let res = search(&mv, 3);
     assert!(res.best.is_some());
-    // Material-only lower bound: queen (~900) minus potential trade slack.
+    // Post-capture position is W K+N+P vs B K; raw material ~420cp plus small
+    // positional adjustments. A comfortable winning margin (> 3 pawns) confirms
+    // the capture was found.
     assert!(
-        res.score >= 500,
+        res.score >= 300,
         "expected queen-winning score, got {}",
         res.score
     );

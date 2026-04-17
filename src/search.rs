@@ -19,7 +19,7 @@ use crate::movegen::{
 };
 use crate::moves::{Move, TurnPlan};
 use crate::multiverse::Multiverse;
-use crate::types::Color;
+use crate::types::{Color, PieceKind};
 use crate::zobrist::zobrist;
 
 pub const MATE: i32 = 1_000_000;
@@ -72,6 +72,58 @@ fn score_from_tt(score: i32, ply: usize) -> i32 {
     }
 }
 
+/// True if `color` has at least one non-pawn, non-king piece somewhere on any
+/// active board. Used as a zugzwang guard for null-move pruning.
+fn has_non_pawn_material(mv: &Multiverse, color: Color) -> bool {
+    for (&l, tl) in &mv.timelines {
+        if !mv.is_active(l) {
+            continue;
+        }
+        let Some(b) = tl.get_board(tl.latest_t()) else { continue };
+        for y in 0..8i8 {
+            for x in 0..8i8 {
+                if let Some(p) = b.get(x, y) {
+                    if p.color == color
+                        && !matches!(
+                            p.kind,
+                            PieceKind::Pawn | PieceKind::King | PieceKind::Brawn
+                        )
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Build a null-moved multiverse: flip side-to-move on the global counter and on
+/// every active timeline's latest board; clear en-passant flags (they expire).
+/// Semantically: "opponent gets a free turn". Unsound in zugzwang, so callers
+/// must verify `has_non_pawn_material` and `!in_check` first.
+fn null_move(mv: &Multiverse) -> Multiverse {
+    let mut child = mv.clone();
+    child.global_to_move = child.global_to_move.flip();
+    let ls: Vec<i32> = mv
+        .timelines
+        .iter()
+        .filter(|(l, _)| mv.is_active(**l))
+        .map(|(l, _)| *l)
+        .collect();
+    for l in ls {
+        let t = child.timelines.get(&l).map(|tl| tl.latest_t()).unwrap_or(0);
+        if let Some(tl) = child.timelines.get_mut(&l) {
+            if let Some(b) = tl.get_board_mut(t) {
+                b.to_move = b.to_move.flip();
+                b.en_passant = None;
+            }
+        }
+    }
+    child.halfmove_clock = child.halfmove_clock.saturating_add(1);
+    child
+}
+
 struct Ctx {
     deadline: Instant,
     nodes: u64,
@@ -82,6 +134,8 @@ struct Ctx {
     killers: [[u64; 2]; MAX_PLY],
     /// History heuristic: plan-signature -> score.
     history: HashMap<u64, i32>,
+    /// True while evaluating the child of a null-move: prevents recursive null-moves.
+    null_in_tree: bool,
 }
 
 impl Ctx {
@@ -120,6 +174,7 @@ pub fn search_with_timeout(mv: &Multiverse, max_depth: u32, max_ms: u128) -> Sea
         aborted: false,
         killers: [[0; 2]; MAX_PLY],
         history: HashMap::new(),
+        null_in_tree: false,
     };
     let mut best_result = SearchResult {
         best: None,
@@ -413,6 +468,38 @@ fn negamax(
         return quiescence(mv, alpha, beta, ctx, 0);
     }
 
+    // Reverse futility (static null-move): if our static eval is so far above
+    // beta that even losing a couple of pawns over `depth` plies keeps us above,
+    // assume this is a fail-high and return beta without searching.
+    if !in_chk && depth <= 6 && beta.abs() < MATE - MAX_PLY as i32 {
+        let stand = sign(mv.global_to_move) * evaluate(mv);
+        let margin = 85 * depth as i32;
+        if stand - margin >= beta {
+            return beta;
+        }
+    }
+
+    // Null-move pruning: give the opponent a free turn at reduced depth. If even
+    // that fails high, our real moves must too. Skipped when in check, when the
+    // side is in a zugzwang-prone endgame (pawn+king only), at shallow depth, or
+    // directly under another null-move.
+    if !in_chk
+        && depth >= 3
+        && !ctx.null_in_tree
+        && beta < MATE - MAX_PLY as i32
+        && has_non_pawn_material(mv, mv.global_to_move)
+    {
+        let r: u32 = if depth >= 6 { 3 } else { 2 };
+        ctx.null_in_tree = true;
+        let null_child = null_move(mv);
+        let nd = depth.saturating_sub(1 + r);
+        let null_score = -negamax(&null_child, nd, -beta, -beta + 1, ctx, ply + 1);
+        ctx.null_in_tree = false;
+        if !ctx.aborted && null_score >= beta {
+            return beta;
+        }
+    }
+
     let mut plans = generate_legal_turn_plans(mv);
     if plans.is_empty() {
         return if in_chk {
@@ -421,6 +508,16 @@ fn negamax(
             0
         };
     }
+
+    // Futility margin: if stand-pat is this far below alpha, quiet non-check moves
+    // are unlikely to recover.
+    let futility = if depth <= 2 && !in_chk && alpha.abs() < MATE - MAX_PLY as i32 {
+        let stand = sign(mv.global_to_move) * evaluate(mv);
+        let margin = 150 * depth as i32;
+        stand + margin <= alpha
+    } else {
+        false
+    };
     let pv_sig = tt_best.and_then(|i| plans.get(i)).map(plan_sig);
     order_plans_scored(mv, &mut plans, ply, ctx, pv_sig);
     let orig_alpha = alpha;
@@ -431,13 +528,30 @@ fn negamax(
         let child = apply_turn(mv, plan);
         let quiet = is_quiet(plan);
         let gives_check = in_check(&child, child.global_to_move);
+        // Futility pruning: at shallow depth, skip quiet moves that can't raise
+        // stand-pat above alpha, unless they check the opponent.
+        if futility && i > 0 && quiet && !gives_check {
+            continue;
+        }
+        // Late Move Pruning: at low depth, skip quiet moves beyond a threshold
+        // that scales with depth. Keeps the PV and early killers/captures.
+        if depth <= 3
+            && !in_chk
+            && !gives_check
+            && quiet
+            && i >= 4 + (depth as usize) * 4
+            && alpha.abs() < MATE - MAX_PLY as i32
+        {
+            continue;
+        }
         // Late Move Reduction: shave a ply off quiet late moves when not in check / not a check.
         let reduce = if depth >= 3 && i >= 3 && quiet && !in_chk && !gives_check {
-            1
+            // Deeper reductions when very late in the list.
+            if i >= 8 { 2 } else { 1 }
         } else {
             0
         };
-        let nd = depth - 1 - reduce;
+        let nd = depth.saturating_sub(1).saturating_sub(reduce);
         let score = if i == 0 {
             -negamax(&child, depth - 1, -beta, -alpha, ctx, ply + 1)
         } else {
