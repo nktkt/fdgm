@@ -1,0 +1,18 @@
+[package]
+name = "fdgm"
+version = "0.1.0"
+edition = "2021"
+description = "5D Chess with Multiverse Time Travel — rule engine and search-based GM"
+
+[[bin]]
+name = "fdgm"
+path = "src/main.rs"
+
+[lib]
+name = "fdgm"
+path = "src/lib.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
